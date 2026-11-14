@@ -1,0 +1,4 @@
+# generated audit reports (contain per-machine software inventory)
+out/
+# portable zip is rebuilt from sources
+*.zip
