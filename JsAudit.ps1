@@ -88,7 +88,7 @@ foreach ($r in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, (Join-Path $env:LO
 }
 
 $markerSet = New-Object 'System.Collections.Generic.HashSet[string]'
-foreach ($m in @('app.asar','chrome_elf.dll','libcef.dll','cef.pak','webview2loader.dll','node.exe')) {
+foreach ($m in @('app.asar','default_app.asar','chrome_elf.dll','libcef.dll','cef.pak','webview2loader.dll','node.exe','deno.exe','bun.exe','nw.exe','nw.dll')) {
     [void]$markerSet.Add($m)
 }
 
@@ -106,6 +106,18 @@ foreach ($child in (Get-ChildItem -LiteralPath $env:LOCALAPPDATA -Directory -For
     if ($localExclude -contains $child.Name) { continue }
     Scan-Root $child.FullName $env:LOCALAPPDATA
 }
+
+# per-user installs hidden inside excluded data dirs: classic Teams (Electron)
+# lives in LOCALAPPDATA\Microsoft\Teams, per-user Chrome in
+# LOCALAPPDATA\Google\Chrome\Application. Their data subdirs stay excluded.
+$msDataExclude = @('Edge','EdgeWebView','EdgeUpdate','EdgeCore','OneDrive','WindowsApps',
+    'Office','SquirrelTemp','Temp','TeamsMeetingAddin','MicrosoftEdgeBackups')
+foreach ($child in (Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'Microsoft') -Directory -Force -ErrorAction SilentlyContinue)) {
+    if ($msDataExclude -contains $child.Name) { continue }
+    Scan-Root $child.FullName (Join-Path $env:LOCALAPPDATA 'Microsoft')
+}
+$chromeApp = Join-Path $env:LOCALAPPDATA 'Google\Chrome\Application'
+if (Test-Path -LiteralPath $chromeApp) { Scan-Root $chromeApp (Join-Path $env:LOCALAPPDATA 'Google') }
 Write-Host ("[scan] total findings: {0}" -f $findings.Count)
 
 # ------------------------------------------------------------
@@ -129,7 +141,7 @@ foreach ($f in $findings) {
     if ($apps[$key].Evidence.Count -lt 5) { $apps[$key].Evidence.Add($f.Path) }
 }
 
-$browserRe = 'chrome|edge|firefox|opera|brave|vivaldi|yandex'
+$browserRe = '\b(chrome|chromium|msedge|edge|firefox|opera|brave|vivaldi|yandex)'
 
 $appList = New-Object System.Collections.Generic.List[object]
 foreach ($a in $apps.Values) {
@@ -137,10 +149,13 @@ foreach ($a in $apps.Values) {
     $name = $a.Name
     $cats = @()
     if ($name -match 'edgewebview') { $cats += 'WebView2Runtime' }
-    elseif ($m -contains 'app.asar') { $cats += 'Electron' }
+    elseif (($m -contains 'app.asar') -or ($m -contains 'default_app.asar')) { $cats += 'Electron' }
     elseif ($name -match $browserRe) { $cats += 'Browser' }
     elseif (($m -contains 'libcef.dll') -or ($m -contains 'cef.pak')) { $cats += 'CEF' }
     elseif ($m -contains 'chrome_elf.dll') { $cats += 'Chromium-embedded' }
+    elseif ($m -contains 'deno.exe') { $cats += 'Deno' }
+    elseif ($m -contains 'bun.exe') { $cats += 'Bun' }
+    elseif (($m -contains 'nw.dll') -or ($m -contains 'nw.exe')) { $cats += 'NW.js' }
     else { $cats += 'Other' }
     if (($cats[0] -ne 'WebView2Runtime') -and ($m -contains 'webview2loader.dll')) { $cats += 'WebView2' }
     if ($m -contains 'node.exe') { $cats += 'Node' }
@@ -263,7 +278,7 @@ if ($nodeOnPath) { $nodePathText = "да ($nodeVer)" }
 # 5. Counts and exports
 # ------------------------------------------------------------
 $engineCounts = [ordered]@{}
-foreach ($e in @('Electron','CEF','WebView2','WebView2Runtime','Chromium-embedded','Node','Browser')) {
+foreach ($e in @('Electron','CEF','WebView2','WebView2Runtime','Chromium-embedded','Node','Deno','Bun','NW.js','Browser')) {
     $engineCounts[$e] = @($appList | Where-Object { $_.Category -match [regex]::Escape($e) }).Count
 }
 $engineCounts['WebView2 hosts (EBWebView)'] = @($wvHosts | ForEach-Object { $_.Name } | Sort-Object -Unique).Count
@@ -287,7 +302,8 @@ $data = [ordered]@{
     policies                 = $policyRows
     live_processes           = $live
 }
-$data | ConvertTo-Json -Depth 6 | Out-File -LiteralPath $jsonPath -Encoding utf8
+$json = $data | ConvertTo-Json -Depth 6
+[IO.File]::WriteAllText($jsonPath, $json, (New-Object System.Text.UTF8Encoding($false)))
 $appList | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
 
 # ------------------------------------------------------------

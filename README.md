@@ -41,11 +41,12 @@ JsAudit.cmd -OutDir "C:\R"   класть отчёты в указанную п�
 
 | Маркер | Движок |
 |---|---|
-| `app.asar` | Electron (приложение целиком на JS) |
+| `app.asar`, `default_app.asar` | Electron (приложение целиком на JS) |
 | `libcef.dll`, `cef.pak` | CEF (Chromium Embedded Framework) |
 | `WebView2Loader.dll`, папка `EBWebView` | WebView2 (контролируется политиками) |
 | `chrome_elf.dll` | вшитый Chromium |
 | `node.exe` | Node.js |
+| `deno.exe`, `bun.exe`, `nw.dll`/`nw.exe` | Deno / Bun / NW.js |
 | `wscript/cscript/mshta` | системный JScript |
 
 Плюс срез живых процессов: кто прямо сейчас крутит JS (включая разбор,
@@ -54,9 +55,13 @@ JsAudit.cmd -OutDir "C:\R"   класть отчёты в указанную п�
 ## Что сканируется
 
 Program Files, Program Files (x86), `%LOCALAPPDATA%\Programs`, верхний
-уровень `%LOCALAPPDATA%` (глубина 7; тяжёлые каталоги данных вроде
-Temp/Google/Microsoft пропускаются). Приложения из нестандартных мест видны,
+уровень `%LOCALAPPDATA%` (глубина 7). Тяжёлые каталоги данных (Temp,
+user data Edge/Chrome/OneDrive) пропускаются, но per-user программы внутри
+них сканируются: classic Teams (`Microsoft\Teams`), per-user Chrome
+(`Google\Chrome\Application`). Приложения из нестандартных мест видны,
 только если запущены в момент прогона (см. таблицу процессов в отчёте).
+MSIX-приложения (`Program Files\WindowsApps`) без прав администратора
+не просматриваются — но их WebView2 виден по папкам EBWebView.
 
 Ограничение: на жёстко залоченных корпоративных ПК PowerShell может быть
 запрещён политиками — там не заведётся.
