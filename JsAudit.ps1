@@ -1,5 +1,5 @@
 ﻿# =============================================================
-#  JsAudit.ps1 - audit of embedded JS engines on Windows
+#  JsAudit.ps1 - audit of embedded JS engines on Windows  (v1.1)
 #  Looks for: Electron, CEF, WebView2, Chromium-embedded,
 #             Node.js, full browsers, system JScript (WSH/MSHTA)
 #  Report: HTML histogram (no JS inside), CSV, JSON
@@ -109,15 +109,18 @@ foreach ($child in (Get-ChildItem -LiteralPath $env:LOCALAPPDATA -Directory -For
 
 # per-user installs hidden inside excluded data dirs: classic Teams (Electron)
 # lives in LOCALAPPDATA\Microsoft\Teams, per-user Chrome in
-# LOCALAPPDATA\Google\Chrome\Application. Their data subdirs stay excluded.
+# LOCALAPPDATA\Google\Chrome\Application, per-user Brave in
+# BraveSoftware\Brave-Browser\Application. Their data subdirs stay excluded.
 $msDataExclude = @('Edge','EdgeWebView','EdgeUpdate','EdgeCore','OneDrive','WindowsApps',
-    'Office','SquirrelTemp','Temp','TeamsMeetingAddin','MicrosoftEdgeBackups')
+    'Office','SquirrelTemp','Temp','TeamsMeetingAddin','MicrosoftEdgeBackups','Windows')
 foreach ($child in (Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'Microsoft') -Directory -Force -ErrorAction SilentlyContinue)) {
     if ($msDataExclude -contains $child.Name) { continue }
     Scan-Root $child.FullName (Join-Path $env:LOCALAPPDATA 'Microsoft')
 }
-$chromeApp = Join-Path $env:LOCALAPPDATA 'Google\Chrome\Application'
-if (Test-Path -LiteralPath $chromeApp) { Scan-Root $chromeApp (Join-Path $env:LOCALAPPDATA 'Google') }
+foreach ($extra in @('Google\Chrome\Application','BraveSoftware\Brave-Browser\Application')) {
+    $p = Join-Path $env:LOCALAPPDATA $extra
+    if (Test-Path -LiteralPath $p) { Scan-Root $p $env:LOCALAPPDATA; $roots += $p }
+}
 Write-Host ("[scan] total findings: {0}" -f $findings.Count)
 
 # ------------------------------------------------------------
@@ -232,13 +235,18 @@ foreach ($hive in @(
 # ------------------------------------------------------------
 Write-Host "[proc] process snapshot..."
 $procs = Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {
-    [pscustomobject]@{ Name = $_.Name; Pid = $_.ProcessId; PPid = $_.ParentProcessId; Exe = $_.ExecutablePath }
+    [pscustomobject]@{ Name = $_.Name; Pid = $_.ProcessId; PPid = $_.ParentProcessId; Exe = $_.ExecutablePath; Created = $_.CreationDate }
 }
 $byId = @{}
 foreach ($p in $procs) { $byId[$p.Pid] = $p }
 
+# exact browser exe names: MicrosoftEdgeUpdate.exe and friends are NOT browsers
+$browserExes = @('chrome.exe','msedge.exe','firefox.exe','opera.exe','brave.exe',
+    'vivaldi.exe','browser.exe','yandex.exe')
+
 $live = New-Object System.Collections.Generic.List[object]
 $asarChecked = @{}
+$nwChecked = @{}
 foreach ($p in $procs) {
     if (-not $p.Name) { continue }
     $n = $p.Name.ToLower()
@@ -248,19 +256,30 @@ foreach ($p in $procs) {
         while ($cur -and ($cur.Name -ieq 'msedgewebview2.exe') -and ($hops -lt 8)) {
             $cur = $byId[$cur.PPid]; $hops++
         }
+        # parent younger than child => PID was reused, host is unknown
+        if ($cur -and $p.Created -and $cur.Created -and ($cur.Created -gt $p.Created)) { $cur = $null }
         $hostName = if ($cur) { $cur.Name } else { 'unknown' }
         $kind = "WebView2 host: $hostName"
     }
     elseif ($n -eq 'node.exe') { $kind = 'Node.js' }
     elseif ($n -eq 'wscript.exe' -or $n -eq 'cscript.exe') { $kind = 'WSH (JScript)' }
     elseif ($n -eq 'mshta.exe') { $kind = 'MSHTA (JScript)' }
-    elseif ($n -match $browserRe) { $kind = 'Browser' }
+    elseif ($browserExes -contains $n) { $kind = 'Browser' }
     elseif ($p.Exe) {
         $dir = Split-Path $p.Exe -Parent
         if (-not $asarChecked.ContainsKey($dir)) {
-            $asarChecked[$dir] = (Test-Path -LiteralPath (Join-Path $dir 'resources\app.asar'))
+            # Electron without asar: unpacked resources\app
+            $asarChecked[$dir] = (Test-Path -LiteralPath (Join-Path $dir 'resources\app.asar')) -or
+                                 (Test-Path -LiteralPath (Join-Path $dir 'resources\app\package.json'))
         }
         if ($asarChecked[$dir]) { $kind = 'Electron' }
+        else {
+            if (-not $nwChecked.ContainsKey($dir)) {
+                # renamed NW.js exe: nw.dll gives it away
+                $nwChecked[$dir] = (Test-Path -LiteralPath (Join-Path $dir 'nw.dll'))
+            }
+            if ($nwChecked[$dir]) { $kind = 'NW.js' }
+        }
     }
     if ($kind) {
         $live.Add([pscustomobject]@{ Kind = $kind; Name = $p.Name; Pid = $p.Pid; Exe = [string]$p.Exe })
@@ -270,16 +289,20 @@ Write-Host ("[proc] live JS processes: {0}" -f $live.Count)
 
 $nodeOnPath = Get-Command node.exe -ErrorAction SilentlyContinue
 $nodeVer = ''
-if ($nodeOnPath) { try { $nodeVer = [string](& node.exe --version 2>$null) } catch { $nodeVer = '' } }
+# read version from file metadata: no binary launch, audit stays read-only
+if ($nodeOnPath) {
+    try { $nodeVer = [string](Get-Item -LiteralPath $nodeOnPath.Source).VersionInfo.ProductVersion }
+    catch { $nodeVer = '' }
+}
 $nodePathText = 'нет'
-if ($nodeOnPath) { $nodePathText = "да ($nodeVer)" }
+if ($nodeOnPath) { $nodePathText = if ($nodeVer) { "да ($nodeVer)" } else { 'да' } }
 
 # ------------------------------------------------------------
 # 5. Counts and exports
 # ------------------------------------------------------------
 $engineCounts = [ordered]@{}
 foreach ($e in @('Electron','CEF','WebView2','WebView2Runtime','Chromium-embedded','Node','Deno','Bun','NW.js','Browser')) {
-    $engineCounts[$e] = @($appList | Where-Object { $_.Category -match [regex]::Escape($e) }).Count
+    $engineCounts[$e] = @($appList | Where-Object { ($_.Category -split '\+') -contains $e }).Count
 }
 $engineCounts['WebView2 hosts (EBWebView)'] = @($wvHosts | ForEach-Object { $_.Name } | Sort-Object -Unique).Count
 
@@ -375,12 +398,15 @@ if ($wvRuntime.Count -gt 0) {
     $rtHtml = "<p class='muted'>WebView2 Runtime не найден.</p>"
 }
 
+$machineHtml = Enc $machine
+$nodePathHtml = Enc $nodePathText
+
 $html = @"
 <!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>Аудит JS-движков — $machine</title>
+<title>Аудит JS-движков — $machineHtml</title>
 <style>
 body { font-family: 'Segoe UI', Arial, sans-serif; max-width: 960px; margin: 24px auto; color: #1a1a1a; padding: 0 12px; }
 h1 { font-size: 22px; margin-bottom: 2px; }
@@ -404,12 +430,12 @@ ul { font-size: 13px; }
 </head>
 <body>
 <h1>Аудит JS-движков в системе</h1>
-<div class="sub">Хост: $machine &middot; Дата: $stamp &middot; Скрипт: JsAudit.ps1</div>
+<div class="sub">Хост: $machineHtml &middot; Дата: $stamp &middot; Скрипт: JsAudit.ps1 v1.1</div>
 <div class="summary">
 Приложений с вшитым JS-движком: <b>$($appList.Count)</b> &middot;
 JS-процессов сейчас: <b>$($live.Count)</b> &middot;
 Активных хостов WebView2: <b>$($wvHosts.Count)</b> &middot;
-Node.js на PATH: <b>$nodePathText</b>
+Node.js на PATH: <b>$nodePathHtml</b>
 </div>
 $chartEngines
 $chartLive
@@ -429,8 +455,9 @@ $liveHtml
 <li><b>CEF</b> — Chromium Embedded Framework, вшитый браузер для части интерфейса.</li>
 <li><b>WebView2</b> — системный рантайм Edge; JS здесь управляется политиками реестра — это и есть точка контроля.</li>
 <li><b>Firefox</b> тоже исполняет JS, но на движке SpiderMonkey (не V8); учтён в категории Browser.</li>
+<li><b>Deno / Bun / NW.js</b> — альтернативные JS-рантаймы (маркеры deno.exe, bun.exe, nw.dll / nw.exe).</li>
 <li><b>WSH / MSHTA</b> — системный JScript Windows, работает вне всяких браузеров (двойной клик по .js/.hta).</li>
-<li>Ограничения: сканировались Program Files, Program Files (x86), %LOCALAPPDATA%\Programs и верхний уровень %LOCALAPPDATA% (глубина 7, тяжёлые каталоги данных исключены). Приложения в нестандартных местах видны только если запущены прямо сейчас (см. таблицу процессов).</li>
+<li>Ограничения: сканируются Program Files, Program Files (x86), %LOCALAPPDATA%\Programs, верхний уровень %LOCALAPPDATA% (глубина 7) плюс точечно classic Teams и per-user Chrome/Brave. MSIX-приложения (Store) видны по папкам EBWebView и в таблице процессов; их бинарники в WindowsApps недоступны без администратора. Приложения в нестандартных местах видны, только если запущены прямо сейчас.</li>
 <li>Отчёт собран без единой строки JavaScript — только HTML + CSS.</li>
 </ul>
 </body>
